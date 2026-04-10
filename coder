@@ -9,6 +9,9 @@ INSTALL_DIR="${HOME}/.local/bin"
 INSTALL_PATH="${INSTALL_DIR}/${APP_NAME}"
 STATE_FILE="${APP_DIR}/active_profile"
 PENDING_ACTIVATION_FILE="${APP_DIR}/pending_activation"
+UPDATE_CHECK_FILE="${APP_DIR}/last_update_check"
+UPDATE_CHECK_INTERVAL_SECONDS=86400
+UPDATE_URL="${UPDATE_URL:-https://raw.githubusercontent.com/jerrielu/coder/main/coder}"
 SELF_PATH=""
 USE_COLOR=0
 ESC=""
@@ -135,6 +138,82 @@ trim() {
 
 ensure_dirs() {
   mkdir -p "$APP_DIR" "$PROFILES_DIR" "$INSTALL_DIR"
+}
+
+now_epoch() {
+  date +%s 2>/dev/null || printf '0'
+}
+
+download_update_candidate() {
+  local output_path="$1"
+
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL --connect-timeout 3 --max-time 8 "$UPDATE_URL" -o "$output_path"
+    return $?
+  fi
+
+  if command -v wget >/dev/null 2>&1; then
+    wget -q --timeout=8 -O "$output_path" "$UPDATE_URL"
+    return $?
+  fi
+
+  return 1
+}
+
+should_check_for_update() {
+  local now last_check raw
+
+  [[ "${CODER_SKIP_UPDATE_CHECK:-0}" == "1" ]] && return 1
+  [[ -t 0 && -t 1 ]] || return 1
+
+  now="$(now_epoch)"
+  [[ "$now" =~ ^[0-9]+$ ]] || return 1
+
+  if [[ -f "$UPDATE_CHECK_FILE" ]]; then
+    raw="$(<"$UPDATE_CHECK_FILE")"
+    if [[ "$raw" =~ ^[0-9]+$ ]]; then
+      last_check="$raw"
+      if (( now - last_check < UPDATE_CHECK_INTERVAL_SECONDS )); then
+        return 1
+      fi
+    fi
+  fi
+
+  printf '%s' "$now" > "$UPDATE_CHECK_FILE" 2>/dev/null || true
+  return 0
+}
+
+auto_update_prompt() {
+  local tmp_file
+
+  should_check_for_update || return 0
+
+  tmp_file="$(mktemp "${APP_DIR}/.coder.update.XXXXXX")" || return 0
+  if ! download_update_candidate "$tmp_file"; then
+    rm -f "$tmp_file"
+    return 0
+  fi
+
+  if [[ ! -f "$INSTALL_PATH" ]] || ! cmp -s "$INSTALL_PATH" "$tmp_file"; then
+    print_info "A newer version of coder is available."
+    if confirm_action "Install update now"; then
+      chmod +x "$tmp_file" || {
+        print_error "Unable to prepare update candidate"
+        rm -f "$tmp_file"
+        return 0
+      }
+      if "$tmp_file" --install; then
+        print_success "coder updated"
+      else
+        print_error "Update failed"
+      fi
+    else
+      print_info "Update skipped"
+    fi
+  fi
+
+  rm -f "$tmp_file"
+  return 0
 }
 
 ensure_path_in_file() {
@@ -485,10 +564,8 @@ load_profile_names() {
 
 tool_display_name() {
   case "$1" in
-    CLOUD_CODE) printf '%s' "Cloud Code" ;;
+    CLAUDE_CODE) printf '%s' "Claude Code" ;;
     OPENAI) printf '%s' "OpenAI Codex / OpenAI API" ;;
-    GEMINI) printf '%s' "Gemini" ;;
-    OPEN_CODE) printf '%s' "Open Code" ;;
     CUSTOM) printf '%s' "Custom Tool" ;;
     *) printf '%s' "$1" ;;
   esac
@@ -496,17 +573,11 @@ tool_display_name() {
 
 tool_vars_for_type() {
   case "$1" in
-    CLOUD_CODE)
-      printf '%s\n' "CLOUD_CODE_API_KEY" "CLOUD_CODE_ENDPOINT"
+    CLAUDE_CODE)
+      printf '%s\n' "ANTHROPIC_API_KEY" "ANTHROPIC_BASE_URL"
       ;;
     OPENAI)
       printf '%s\n' "OPENAI_API_KEY" "OPENAI_BASE_URL"
-      ;;
-    GEMINI)
-      printf '%s\n' "GOOGLE_API_KEY" "GOOGLE_API_URL"
-      ;;
-    OPEN_CODE)
-      printf '%s\n' "OPEN_CODE_API_KEY" "OPEN_CODE_URL"
       ;;
     *)
       return 1
@@ -574,18 +645,14 @@ list_profiles() {
 choose_tool() {
   local key selected index
   local labels=(
-    "Cloud Code"
+    "Claude Code"
     "OpenAI Codex / OpenAI API"
-    "Gemini"
-    "Open Code"
     "Custom Tool"
     "Back"
   )
   local values=(
-    "CLOUD_CODE"
+    "CLAUDE_CODE"
     "OPENAI"
-    "GEMINI"
-    "OPEN_CODE"
     "CUSTOM"
     "__BACK__"
   )
@@ -1209,6 +1276,7 @@ main() {
     "")
       ensure_dirs
       self_install || exit 1
+      auto_update_prompt
       main_menu
       ;;
     --install)
