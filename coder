@@ -1,0 +1,1245 @@
+#!/usr/bin/env bash
+
+set -u
+
+APP_NAME="coder"
+APP_DIR="${HOME}/.coder"
+PROFILES_DIR="${APP_DIR}/profiles"
+INSTALL_DIR="${HOME}/.local/bin"
+INSTALL_PATH="${INSTALL_DIR}/${APP_NAME}"
+STATE_FILE="${APP_DIR}/active_profile"
+PENDING_ACTIVATION_FILE="${APP_DIR}/pending_activation"
+SELF_PATH=""
+USE_COLOR=0
+ESC=""
+RESET=""
+BOLD=""
+DIM=""
+RED=""
+GREEN=""
+YELLOW=""
+BLUE=""
+MAGENTA=""
+CYAN=""
+WHITE=""
+CARD_BORDER=""
+CARD_ACCENT=""
+LANDING_PAGE_SIZE=6
+CHOSEN_TOOL=""
+ACTIVATION_TOOL=""
+ACTIVATION_KEYS=()
+ACTIVATION_VALUES=()
+
+if [[ -n "${BASH_SOURCE[0]:-}" ]]; then
+  SELF_PATH="${BASH_SOURCE[0]}"
+elif [[ -n "${0:-}" ]]; then
+  SELF_PATH="${0}"
+fi
+
+init_colors() {
+  if [[ -t 1 && "${TERM:-}" != "dumb" ]]; then
+    USE_COLOR=1
+    ESC=$'\033['
+    RESET="${ESC}0m"
+    BOLD="${ESC}1m"
+    DIM="${ESC}2m"
+    RED="${ESC}31m"
+    GREEN="${ESC}32m"
+    YELLOW="${ESC}33m"
+    BLUE="${ESC}34m"
+    MAGENTA="${ESC}35m"
+    CYAN="${ESC}36m"
+    WHITE="${ESC}97m"
+    CARD_BORDER="${ESC}38;5;240m"
+    CARD_ACCENT="${ESC}38;5;45m"
+  fi
+}
+
+is_sourced() {
+  [[ "${BASH_SOURCE[0]}" != "$0" ]]
+}
+
+pause() {
+  printf '\n%sPress Enter to continue...%s' "${DIM}" "${RESET}"
+  IFS= read -r _
+}
+
+print_line() {
+  printf '%s%s%s\n' "${CARD_BORDER}" "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" "${RESET}"
+}
+
+print_banner() {
+  print_line
+  printf '%s%s  coder%s%s\n' "${BOLD}" "${CARD_ACCENT}" "${RESET}" "${DIM}  profile manager${RESET}"
+  print_line
+}
+
+print_section() {
+  local title="$1"
+  printf '\n%s%s%s\n' "${BOLD}" "$title" "${RESET}"
+  print_line
+}
+
+print_option() {
+  local key="$1"
+  local label="$2"
+  printf '%s[%s]%s %s\n' "${CARD_ACCENT}" "$key" "${RESET}" "$label"
+}
+
+print_picker_option() {
+  local selected="$1"
+  local label="$2"
+  local marker=" "
+  local accent="$CARD_BORDER"
+
+  if [[ "$selected" == "1" ]]; then
+    marker="›"
+    accent="$CARD_ACCENT"
+  fi
+
+  printf '%s%s%s %s%s%s\n' "${accent}" "$marker" "${RESET}" "${BOLD}" "$label" "${RESET}"
+}
+
+print_footer_item() {
+  local key="$1"
+  local label="$2"
+  printf '%s[%s]%s %s  ' "${CARD_ACCENT}" "$key" "${RESET}" "$label"
+}
+
+print_info() {
+  printf '%s%s%s %s\n' "${BLUE}" "info" "${RESET}" "$1"
+}
+
+print_success() {
+  printf '%s%s%s %s\n' "${GREEN}" "success" "${RESET}" "$1"
+}
+
+print_warning() {
+  printf '%s%s%s %s\n' "${YELLOW}" "warning" "${RESET}" "$1"
+}
+
+print_error() {
+  printf '%s%s%s %s\n' "${RED}" "error" "${RESET}" "$1" >&2
+}
+
+print_value() {
+  printf '%s%s%s' "${WHITE}" "$1" "${RESET}"
+}
+
+trim() {
+  local value="$1"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s' "$value"
+}
+
+ensure_dirs() {
+  mkdir -p "$APP_DIR" "$PROFILES_DIR" "$INSTALL_DIR"
+}
+
+ensure_path_in_file() {
+  local rc_file="$1"
+  local marker_start marker_end block existing
+
+  marker_start="# >>> coder path >>>"
+  marker_end="# <<< coder path <<<"
+
+  if [[ -f "$rc_file" ]]; then
+    existing="$(<"$rc_file")"
+    if [[ "$existing" == *"$marker_start"* ]] || [[ "$existing" == *'$HOME/.local/bin'* ]] || [[ "$existing" == *'${HOME}/.local/bin'* ]]; then
+      return 0
+    fi
+  fi
+
+  block=$'\n'"$marker_start"$'\n'
+  block+=$'export PATH="$HOME/.local/bin:$PATH"\n'
+  block+="$marker_end"$'\n'
+
+  if ! printf '%s' "$block" >> "$rc_file"; then
+    print_error "PATH update failed for ${rc_file}"
+    return 1
+  fi
+
+  print_success "Added ${INSTALL_DIR} to PATH in ${rc_file}"
+  return 0
+}
+
+ensure_path_in_shell_profiles() {
+  local rc_file
+  local files=(
+    "${HOME}/.profile"
+    "${HOME}/.bash_profile"
+    "${HOME}/.bashrc"
+    "${HOME}/.zprofile"
+    "${HOME}/.zshrc"
+  )
+
+  for rc_file in "${files[@]}"; do
+    ensure_path_in_file "$rc_file" || return 1
+  done
+
+  return 0
+}
+
+self_install() {
+  ensure_dirs
+  local copied=0
+
+  if [[ ! -f "$SELF_PATH" ]]; then
+    print_error "Unable to locate the current script"
+    return 1
+  fi
+
+  if [[ ! -x "$INSTALL_PATH" || "$SELF_PATH" != "$INSTALL_PATH" ]]; then
+    if ! cp "$SELF_PATH" "$INSTALL_PATH"; then
+      print_error "Failed to copy script to ${INSTALL_PATH}"
+      return 1
+    fi
+
+    if ! chmod +x "$INSTALL_PATH"; then
+      print_error "Failed to make ${INSTALL_PATH} executable"
+      return 1
+    fi
+    copied=1
+  fi
+
+  if ! ensure_path_in_shell_profiles; then
+    print_warning "Unable to persist ${INSTALL_DIR} in shell startup files"
+  fi
+
+  if ! ensure_shell_hook_in_shell_profiles; then
+    print_warning "Unable to persist shell hook in startup files"
+  fi
+
+  if (( copied == 1 )); then
+    print_success "Installed to ${INSTALL_PATH}"
+  fi
+
+  case ":${PATH:-}:" in
+    *":${INSTALL_DIR}:"*) ;;
+    *)
+      print_info "${INSTALL_PATH} will be available in new shells after reloading your shell config"
+      printf '%sCurrent shell one-time command:%s\n' "${DIM}" "${RESET}"
+      printf '  %sexport PATH="$HOME/.local/bin:$PATH"%s\n' "${CYAN}" "${RESET}"
+      ;;
+  esac
+
+  return 0
+}
+
+detect_rc_file() {
+  if [[ -n "${ZSH_VERSION:-}" ]]; then
+    printf '%s' "${HOME}/.zshrc"
+  else
+    printf '%s' "${HOME}/.bashrc"
+  fi
+}
+
+shell_hook_block() {
+  local marker_start="$1"
+  local marker_end="$2"
+  local block
+
+  block=$'\n'"$marker_start"$'\n'
+  block+=$'coder() {\n'
+  block+=$'  local _coder_bin="'"$INSTALL_PATH"$'"\n'
+  block+=$'  local _coder_pending="$HOME/.coder/pending_activation"\n'
+  block+=$'  "$_coder_bin" "$@"\n'
+  block+=$'  local _coder_status=$?\n'
+  block+=$'  if [[ "${1:-}" != "--emit-activate" && -f "$_coder_pending" ]]; then\n'
+  block+=$'    local _coder_profile=""\n'
+  block+=$'    IFS= read -r _coder_profile < "$_coder_pending"\n'
+  block+=$'    rm -f "$_coder_pending"\n'
+  block+=$'    if [[ -n "$_coder_profile" ]]; then\n'
+  block+=$'      eval "$($_coder_bin --emit-activate "$_coder_profile")"\n'
+  block+=$'    fi\n'
+  block+=$'  fi\n'
+  block+=$'  return "$_coder_status"\n'
+  block+=$'}\n'
+  block+="$marker_end"$'\n'
+  printf '%s' "$block"
+}
+
+upsert_marked_block() {
+  local target_file="$1"
+  local marker_start="$2"
+  local marker_end="$3"
+  local replacement_block="$4"
+  local tmp_file line in_block=0
+
+  tmp_file="$(mktemp "${APP_DIR}/.coder.block.XXXXXX")" || return 1
+
+  if [[ -f "$target_file" ]]; then
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      if [[ "$line" == "$marker_start" ]]; then
+        in_block=1
+        continue
+      fi
+      if (( in_block == 1 )); then
+        if [[ "$line" == "$marker_end" ]]; then
+          in_block=0
+        fi
+        continue
+      fi
+      printf '%s\n' "$line" >> "$tmp_file" || {
+        rm -f "$tmp_file"
+        return 1
+      }
+    done < "$target_file"
+  fi
+
+  if ! printf '%s' "$replacement_block" >> "$tmp_file"; then
+    rm -f "$tmp_file"
+    return 1
+  fi
+
+  if ! mv "$tmp_file" "$target_file"; then
+    rm -f "$tmp_file"
+    return 1
+  fi
+
+  return 0
+}
+
+install_shell_hook() {
+  ensure_dirs
+
+  local rc_file marker_start marker_end block existing
+  rc_file="${1:-$(detect_rc_file)}"
+  marker_start="# >>> coder shell integration >>>"
+  marker_end="# <<< coder shell integration <<<"
+  block="$(shell_hook_block "$marker_start" "$marker_end")"
+
+  if [[ -f "$rc_file" ]]; then
+    existing="$(<"$rc_file")"
+    if [[ "$existing" == *"$block"* ]]; then
+      return 0
+    fi
+  fi
+
+  if ! upsert_marked_block "$rc_file" "$marker_start" "$marker_end" "$block"; then
+    print_error "Failed to update ${rc_file} with shell hook"
+    return 1
+  fi
+
+  print_success "Shell hook installed in ${rc_file}"
+  return 0
+}
+
+ensure_shell_hook_in_shell_profiles() {
+  local rc_file
+  local files=(
+    "${HOME}/.profile"
+    "${HOME}/.bash_profile"
+    "${HOME}/.bashrc"
+    "${HOME}/.zprofile"
+    "${HOME}/.zshrc"
+  )
+
+  for rc_file in "${files[@]}"; do
+    install_shell_hook "$rc_file" || return 1
+  done
+
+  return 0
+}
+
+profile_path() {
+  printf '%s/%s.profile' "$PROFILES_DIR" "$1"
+}
+
+is_valid_profile_name() {
+  local name="$1"
+  [[ -n "$name" && "$name" != *"/"* && "$name" != *$'\n'* && "$name" != *$'\r'* ]]
+}
+
+is_valid_env_key() {
+  local key="$1"
+  [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]
+}
+
+shell_escape() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  value="${value//\$/\\\$}"
+  value="${value//\`/\\\`}"
+  printf '"%s"' "$value"
+}
+
+ask() {
+  local prompt="$1"
+  local answer
+  printf '%s›%s %s' "${CARD_ACCENT}" "${RESET}" "$prompt" >&2
+  if ! IFS= read -r answer; then
+    return 1
+  fi
+  printf '%s' "$answer"
+}
+
+read_key() {
+  local key rest1 rest2
+  if ! IFS= read -rsn1 key; then
+    return 1
+  fi
+
+  if [[ "$key" == $'\033' ]]; then
+    if IFS= read -rsn1 -t 0.05 rest1; then
+      if IFS= read -rsn1 -t 0.05 rest2; then
+        printf '%s%s%s' "$key" "$rest1" "$rest2"
+      else
+        printf '%s%s' "$key" "$rest1"
+      fi
+    else
+      printf '%s' "$key"
+    fi
+    return 0
+  fi
+
+  printf '%s' "$key"
+  return 0
+}
+
+read_profile_field() {
+  local path="$1"
+  local wanted="$2"
+  local line key value
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    key="${line%%=*}"
+    value="${line#*=}"
+    if [[ "$key" == "$wanted" ]]; then
+      printf '%s' "$value"
+      return 0
+    fi
+  done < "$path"
+
+  return 1
+}
+
+load_activation_data() {
+  local name="$1"
+  local path line key value
+
+  path="$(profile_path "$name")"
+  if [[ ! -f "$path" ]]; then
+    return 1
+  fi
+
+  ACTIVATION_TOOL="$(read_profile_field "$path" "tool" 2>/dev/null || true)"
+  ACTIVATION_KEYS=("CODER_ACTIVE_PROFILE" "CODER_ACTIVE_TOOL")
+  ACTIVATION_VALUES=("$name" "$ACTIVATION_TOOL")
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    key="${line%%=*}"
+    value="${line#*=}"
+    if [[ "$key" == env_* ]]; then
+      ACTIVATION_KEYS+=("${key#env_}")
+      ACTIVATION_VALUES+=("$value")
+    fi
+  done < "$path"
+
+  return 0
+}
+
+print_activation_details() {
+  local state_written="$1"
+  local exported_now="$2"
+  local queued_for_hook="${3:-0}"
+  local idx
+
+  printf '%sActivation details:%s\n' "${BOLD}" "${RESET}"
+  if [[ "$state_written" == "1" ]]; then
+    printf '  - wrote %sactive_profile%s = %s%s%s\n' "${DIM}" "${RESET}" "${WHITE}" "${ACTIVATION_VALUES[0]}" "${RESET}"
+  else
+    printf '  - did not update %sactive_profile%s marker\n' "${DIM}" "${RESET}"
+  fi
+
+  if [[ "$exported_now" == "1" ]]; then
+    printf '  - exported environment in current shell:\n'
+  else
+    if [[ "$queued_for_hook" == "1" ]]; then
+      printf '  - queued activation handoff in %s\n' "$PENDING_ACTIVATION_FILE"
+    else
+      printf '  - no environment exported in this process\n'
+    fi
+    printf '  - pending export set:\n'
+  fi
+
+  for (( idx=0; idx<${#ACTIVATION_KEYS[@]}; idx+=1 )); do
+    printf '    %s=%s\n' "${ACTIVATION_KEYS[idx]}" "${ACTIVATION_VALUES[idx]}"
+  done
+}
+
+load_profile_names() {
+  local file name
+  PROFILE_NAMES=()
+
+  shopt -s nullglob
+  for file in "$PROFILES_DIR"/*.profile; do
+    name="${file##*/}"
+    name="${name%.profile}"
+    PROFILE_NAMES+=("$name")
+  done
+  shopt -u nullglob
+}
+
+tool_display_name() {
+  case "$1" in
+    CLOUD_CODE) printf '%s' "Cloud Code" ;;
+    OPENAI) printf '%s' "OpenAI Codex / OpenAI API" ;;
+    GEMINI) printf '%s' "Gemini" ;;
+    OPEN_CODE) printf '%s' "Open Code" ;;
+    CUSTOM) printf '%s' "Custom Tool" ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+tool_vars_for_type() {
+  case "$1" in
+    CLOUD_CODE)
+      printf '%s\n' "CLOUD_CODE_API_KEY" "CLOUD_CODE_ENDPOINT"
+      ;;
+    OPENAI)
+      printf '%s\n' "OPENAI_API_KEY" "OPENAI_BASE_URL"
+      ;;
+    GEMINI)
+      printf '%s\n' "GOOGLE_API_KEY" "GOOGLE_API_URL"
+      ;;
+    OPEN_CODE)
+      printf '%s\n' "OPEN_CODE_API_KEY" "OPEN_CODE_URL"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+show_profile_summary() {
+  local path="$1"
+  local line key value
+  local tool metadata found=0
+
+  tool="$(read_profile_field "$path" "tool" 2>/dev/null || true)"
+  metadata="$(read_profile_field "$path" "metadata" 2>/dev/null || true)"
+
+  printf '%sTool:%s %s\n' "${DIM}" "${RESET}" "$(tool_display_name "$tool")"
+  printf '%sMetadata:%s %s\n' "${DIM}" "${RESET}" "${metadata:-<none>}"
+  printf '%sEnvironment Variables:%s\n' "${DIM}" "${RESET}"
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    key="${line%%=*}"
+    value="${line#*=}"
+    if [[ "$key" == env_* ]]; then
+      printf '  %s%s%s=%s%s%s\n' "${CYAN}" "${key#env_}" "${RESET}" "${WHITE}" "$value" "${RESET}"
+      found=1
+    fi
+  done < "$path"
+
+  if (( found == 0 )); then
+    printf '  %s<none>%s\n' "${DIM}" "${RESET}"
+  fi
+}
+
+list_profiles() {
+  ensure_dirs
+
+  local file name active found=0
+  active=""
+  if [[ -f "$STATE_FILE" ]]; then
+    active="$(<"$STATE_FILE")"
+  fi
+
+  print_section "Profiles"
+
+  shopt -s nullglob
+  for file in "$PROFILES_DIR"/*.profile; do
+    found=1
+    name="${file##*/}"
+    name="${name%.profile}"
+    if [[ "$name" == "$active" ]]; then
+      printf '%s•%s %s %s[active]%s\n' "${GREEN}" "${RESET}" "$name" "${GREEN}" "${RESET}"
+    else
+      printf '%s•%s %s\n' "${CARD_ACCENT}" "${RESET}" "$name"
+    fi
+    show_profile_summary "$file"
+    print_line
+  done
+  shopt -u nullglob
+
+  if (( found == 0 )); then
+    print_info "No profiles found"
+  fi
+}
+
+choose_tool() {
+  local key selected index
+  local labels=(
+    "Cloud Code"
+    "OpenAI Codex / OpenAI API"
+    "Gemini"
+    "Open Code"
+    "Custom Tool"
+    "Back"
+  )
+  local values=(
+    "CLOUD_CODE"
+    "OPENAI"
+    "GEMINI"
+    "OPEN_CODE"
+    "CUSTOM"
+    "__BACK__"
+  )
+
+  selected=0
+  CHOSEN_TOOL=""
+
+  while true; do
+    clear 2>/dev/null || true
+    print_banner
+    print_section "Select Tool"
+    printf '%sUse arrow keys to choose a tool, then press Enter.%s\n\n' "${DIM}" "${RESET}"
+
+    for (( index=0; index<${#labels[@]}; index+=1 )); do
+      if (( index == selected )); then
+        print_picker_option "1" "${labels[index]}"
+      else
+        print_picker_option "0" "${labels[index]}"
+      fi
+    done
+
+    printf '\n'
+    print_line
+    print_footer_item "↑/↓" "Select"
+    print_footer_item "Enter" "Confirm"
+    printf '\n\n'
+
+    key="$(read_key)" || return 1
+
+    case "$key" in
+      $'\033[A')
+        if (( selected > 0 )); then
+          selected=$(( selected - 1 ))
+        fi
+        ;;
+      $'\033[B')
+        if (( selected < ${#labels[@]} - 1 )); then
+          selected=$(( selected + 1 ))
+        fi
+        ;;
+      "")
+        if [[ "${values[selected]}" == "__BACK__" ]]; then
+          return 1
+        fi
+        CHOSEN_TOOL="${values[selected]}"
+        return 0
+        ;;
+    esac
+  done
+}
+
+collect_env_vars_predefined() {
+  local tool="$1"
+  local key value
+  local keys=()
+
+  mapfile -t keys < <(tool_vars_for_type "$tool") || return 1
+
+  for key in "${keys[@]}"; do
+    [[ -z "$key" ]] && continue
+    value="$(ask "${key}: ")" || return 1
+    printf 'env_%s=%s\n' "$key" "$value"
+  done
+}
+
+collect_env_vars_custom() {
+  local count input i key value
+
+  while true; do
+    input="$(ask 'How many environment variables? ')" || return 1
+    if [[ "$input" =~ ^[0-9]+$ ]] && (( input > 0 )); then
+      count="$input"
+      break
+    fi
+    print_warning "Enter a positive number"
+  done
+
+  i=1
+  while (( i <= count )); do
+    while true; do
+      key="$(ask "Variable ${i} key: ")" || return 1
+      if is_valid_env_key "$key"; then
+        break
+      fi
+      print_warning "Invalid key. Use letters, digits, and underscores, and do not start with a digit"
+    done
+    value="$(ask "Variable ${i} value: ")" || return 1
+    printf 'env_%s=%s\n' "$key" "$value"
+    (( i += 1 ))
+  done
+}
+
+write_profile() {
+  local name="$1"
+  local tool="$2"
+  local metadata="$3"
+  local path
+
+  path="$(profile_path "$name")"
+
+  {
+    printf 'tool=%s\n' "$tool"
+    if [[ "$tool" == "CUSTOM" ]]; then
+      collect_env_vars_custom
+    else
+      collect_env_vars_predefined "$tool"
+    fi
+    printf 'metadata=%s\n' "$metadata"
+  } > "$path" || {
+    print_error "Unable to save profile"
+    return 1
+  }
+
+  return 0
+}
+
+select_profile_name() {
+  local choice
+
+  load_profile_names
+
+  if (( ${#PROFILE_NAMES[@]} == 0 )); then
+    print_error "No profiles available"
+    return 1
+  fi
+
+  print_section "Available Profiles"
+
+  for (( i=0; i<${#PROFILE_NAMES[@]}; i+=1 )); do
+    print_option "$((i + 1))" "${PROFILE_NAMES[i]}"
+  done
+  print_option "0" "Back"
+  printf '\n'
+
+  while true; do
+    choice="$(ask 'Select profile: ')" || return 1
+    if [[ "$choice" == "0" ]]; then
+      return 1
+    fi
+    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#PROFILE_NAMES[@]} )); then
+      printf '%s' "${PROFILE_NAMES[choice - 1]}"
+      return 0
+    fi
+    print_warning "Invalid selection"
+  done
+}
+
+show_landing_profiles() {
+  local page="$1"
+  local selected_slot="$2"
+  local active start end total count index slot name path tool prefix suffix
+
+  active=""
+  if [[ -f "$STATE_FILE" ]]; then
+    active="$(<"$STATE_FILE")"
+  fi
+
+  load_profile_names
+  total="${#PROFILE_NAMES[@]}"
+
+  print_banner
+  printf '%sSelect a profile to activate%s\n' "${BOLD}" "${RESET}"
+  printf '%sUse arrow keys to select, Enter to activate, and shortcuts below for actions.%s\n\n' "${DIM}" "${RESET}"
+
+  if (( total == 0 )); then
+    print_info "No profiles found. Press A to add your first profile."
+    return 0
+  fi
+
+  start=$(( page * LANDING_PAGE_SIZE ))
+  end=$(( start + LANDING_PAGE_SIZE ))
+  if (( end > total )); then
+    end=$total
+  fi
+
+  count=0
+  for (( index=start; index<end; index+=1 )); do
+    slot=$(( count + 1 ))
+    name="${PROFILE_NAMES[index]}"
+    path="$(profile_path "$name")"
+    tool="$(read_profile_field "$path" "tool" 2>/dev/null || true)"
+    prefix=" "
+    suffix=""
+
+    if (( slot == selected_slot + 1 )); then
+      prefix="›"
+      suffix="  ${CARD_ACCENT}selected${RESET}"
+    fi
+
+    if [[ "$name" == "$active" ]]; then
+      printf '%s%s [%d]%s %s%s%s  %s%s%s  %sactive%s%s\n' \
+        "${CARD_ACCENT}" "$prefix" "$slot" "${RESET}" \
+        "${BOLD}" "$name" "${RESET}" \
+        "${DIM}" "$(tool_display_name "$tool")" "${RESET}" \
+        "${GREEN}" "${RESET}" \
+        "$suffix"
+    else
+      printf '%s%s [%d]%s %s%s%s  %s%s%s%s\n' \
+        "${CARD_ACCENT}" "$prefix" "$slot" "${RESET}" \
+        "${BOLD}" "$name" "${RESET}" \
+        "${DIM}" "$(tool_display_name "$tool")" "${RESET}" \
+        "$suffix"
+    fi
+    count=$(( count + 1 ))
+  done
+
+  printf '\n%sPage %d of %d%s\n' "${DIM}" "$((page + 1))" "$(((total + LANDING_PAGE_SIZE - 1) / LANDING_PAGE_SIZE))" "${RESET}"
+}
+
+show_landing_footer() {
+  printf '\n'
+  print_line
+  print_footer_item "Enter" "Activate"
+  print_footer_item "A" "Add"
+  print_footer_item "U" "Update"
+  print_footer_item "D" "Delete"
+  print_footer_item "M" "Tools"
+  print_footer_item "Q" "Exit"
+  printf '\n\n'
+}
+
+manage_tools_menu() {
+  local choice rc_file
+
+  while true; do
+    clear 2>/dev/null || true
+    print_banner
+    print_section "Manage Tools"
+    print_option "1" "List Profiles"
+    print_option "2" "Install Shell Hook"
+    print_option "0" "Back"
+    printf '\n'
+
+    choice="$(ask 'Select an option: ')" || return 0
+    printf '\n'
+
+    case "$choice" in
+      1) list_profiles; pause ;;
+      2)
+        rc_file="$(detect_rc_file)"
+        if install_shell_hook "$rc_file"; then
+          printf '%sReload your shell with:%s\n' "${DIM}" "${RESET}"
+          printf '  %ssource "%s"%s\n' "${CYAN}" "$rc_file" "${RESET}"
+        fi
+        pause
+        ;;
+      0) return 0 ;;
+      *) print_warning "Invalid selection"; pause ;;
+    esac
+  done
+}
+
+confirm_action() {
+  local prompt="$1"
+  local confirm
+
+  confirm="$(ask "${prompt} (y/N): ")" || return 1
+  [[ "$confirm" =~ ^[Yy]$ ]]
+}
+
+selected_profile_name() {
+  local page="$1"
+  local selected_slot="$2"
+  local index
+
+  load_profile_names
+  index=$(( page * LANDING_PAGE_SIZE + selected_slot ))
+  if (( index < ${#PROFILE_NAMES[@]} )); then
+    printf '%s' "${PROFILE_NAMES[index]}"
+    return 0
+  fi
+  return 1
+}
+
+activate_profile_by_name() {
+  local name="$1"
+
+  if ! load_activation_data "$name"; then
+    print_error "Profile not found"
+    return 1
+  fi
+
+  if is_sourced; then
+    activate_profile_now "$name"
+    return $?
+  fi
+
+  printf '%s\n' "$name" > "$STATE_FILE" || {
+    print_error "Unable to save active profile state"
+    return 1
+  }
+  printf '%s\n' "$name" > "$PENDING_ACTIVATION_FILE" || {
+    print_error "Unable to queue pending activation"
+    return 1
+  }
+
+  print_info "Activation queued for shell hook auto-export"
+  printf '%sRun:%s\n' "${DIM}" "${RESET}"
+  printf '  %seval "$(%s --emit-activate %s)"%s\n' "${CYAN}" "$INSTALL_PATH" "$name" "${RESET}"
+  printf '%sOptional shell hook:%s\n' "${DIM}" "${RESET}"
+  printf '  %s%s --install-shell-hook%s\n' "${CYAN}" "$INSTALL_PATH" "${RESET}"
+  print_success "Profile \"${name}\" marked as active"
+  print_activation_details "1" "0" "1"
+  return 0
+}
+
+add_profile() {
+  local name name_input tool metadata path
+
+  print_section "Add Profile"
+
+  choose_tool || return 1
+  tool="$CHOSEN_TOOL"
+
+  name_input="$(ask 'Profile name: ')" || return 1
+  name="$(trim "$name_input")"
+  if ! is_valid_profile_name "$name"; then
+    print_warning "Invalid profile name"
+    return 1
+  fi
+
+  path="$(profile_path "$name")"
+  if [[ -e "$path" ]]; then
+    print_warning "A profile with that name already exists"
+    return 1
+  fi
+
+  metadata="$(ask 'Metadata/notes (optional): ')" || return 1
+
+  if ! write_profile "$name" "$tool" "$metadata"; then
+    return 1
+  fi
+
+  print_success "Profile \"${name}\" created"
+}
+
+update_profile_by_name() {
+  local name="$1"
+  local path tool metadata
+
+  path="$(profile_path "$name")"
+  if [[ ! -f "$path" ]]; then
+    print_error "Profile not found"
+    return 1
+  fi
+
+  print_section "Update Profile"
+  printf '\n%sCurrent profile%s\n' "${BOLD}" "${RESET}"
+  show_profile_summary "$path"
+  printf '\n%sYou are updating the selected profile.%s\n' "${DIM}" "${RESET}"
+
+  if ! confirm_action "Continue updating \"${name}\""; then
+    print_info "Update cancelled"
+    return 1
+  fi
+  if ! confirm_action "Confirm update for \"${name}\""; then
+    print_info "Update cancelled"
+    return 1
+  fi
+
+  choose_tool || return 1
+  tool="$CHOSEN_TOOL"
+  metadata="$(ask 'Metadata/notes (optional): ')" || return 1
+
+  if ! write_profile "$name" "$tool" "$metadata"; then
+    return 1
+  fi
+
+  print_success "Profile \"${name}\" updated"
+}
+
+delete_profile_by_name() {
+  local name="$1"
+  local path active
+
+  path="$(profile_path "$name")"
+  if [[ ! -f "$path" ]]; then
+    print_error "Profile not found"
+    return 1
+  fi
+
+  print_section "Delete Profile"
+  printf '\n%sSelected profile%s\n' "${BOLD}" "${RESET}"
+  show_profile_summary "$path"
+
+  if ! confirm_action "Delete \"${name}\""; then
+    print_info "Delete cancelled"
+    return 1
+  fi
+  if ! confirm_action "Confirm permanent delete for \"${name}\""; then
+    print_info "Delete cancelled"
+    return 1
+  fi
+
+  if ! rm -f "$path"; then
+    print_error "Unable to remove profile"
+    return 1
+  fi
+
+  if [[ -f "$STATE_FILE" ]]; then
+    active="$(<"$STATE_FILE")"
+    if [[ "$active" == "$name" ]]; then
+      rm -f "$STATE_FILE"
+    fi
+  fi
+
+  print_success "Profile \"${name}\" deleted"
+}
+
+update_profile() {
+  local name
+
+  print_section "Update Profile"
+
+  name="$(select_profile_name)" || return 1
+  update_profile_by_name "$name"
+}
+
+delete_profile() {
+  local name
+
+  print_section "Delete Profile"
+
+  name="$(select_profile_name)" || return 1
+  delete_profile_by_name "$name"
+}
+
+emit_profile_exports() {
+  local name="$1"
+  local idx
+
+  if ! load_activation_data "$name"; then
+    printf 'printf "%serror%s profile not found.\\n" >&2\n' "${RED}" "${RESET}"
+    return 1
+  fi
+
+  printf 'rm -f %s\n' "$(shell_escape "$PENDING_ACTIVATION_FILE")"
+  for (( idx=0; idx<${#ACTIVATION_KEYS[@]}; idx+=1 )); do
+    printf 'export %s=%s\n' "${ACTIVATION_KEYS[idx]}" "$(shell_escape "${ACTIVATION_VALUES[idx]}")"
+  done
+
+  printf 'printf "%ssuccess%s Profile %%s activated in current shell.\\n" %s\n' "${GREEN}" "${RESET}" "$(shell_escape "$name")"
+  for (( idx=0; idx<${#ACTIVATION_KEYS[@]}; idx+=1 )); do
+    printf 'printf "  exported %s=%%s\\n" %s\n' "${ACTIVATION_KEYS[idx]}" "$(shell_escape "${ACTIVATION_VALUES[idx]}")"
+  done
+  return 0
+}
+
+activate_profile_now() {
+  local name="$1"
+  local idx
+
+  if ! load_activation_data "$name"; then
+    print_error "Profile not found"
+    return 1
+  fi
+
+  for (( idx=0; idx<${#ACTIVATION_KEYS[@]}; idx+=1 )); do
+    export "${ACTIVATION_KEYS[idx]}=${ACTIVATION_VALUES[idx]}"
+  done
+
+  rm -f "$PENDING_ACTIVATION_FILE"
+  printf '%s\n' "$name" > "$STATE_FILE"
+  print_success "Profile \"${name}\" activated in current shell"
+  print_activation_details "1" "1" "0"
+  return 0
+}
+
+activate_profile() {
+  local name
+
+  print_section "Activate Profile"
+
+  name="$(select_profile_name)" || return 1
+  activate_profile_by_name "$name"
+}
+
+main_menu() {
+  local key page total selected_slot page_count last_slot selected_name
+  page=0
+  selected_slot=0
+
+  while true; do
+    clear 2>/dev/null || true
+    load_profile_names
+    total="${#PROFILE_NAMES[@]}"
+
+    if (( total == 0 )); then
+      page=0
+      selected_slot=0
+    else
+      page_count=$(((total + LANDING_PAGE_SIZE - 1) / LANDING_PAGE_SIZE))
+      if (( page >= page_count )); then
+        page=$(( page_count - 1 ))
+      fi
+      last_slot=$(( total - page * LANDING_PAGE_SIZE - 1 ))
+      if (( last_slot >= LANDING_PAGE_SIZE )); then
+        last_slot=$(( LANDING_PAGE_SIZE - 1 ))
+      fi
+      if (( selected_slot > last_slot )); then
+        selected_slot=$last_slot
+      fi
+    fi
+
+    show_landing_profiles "$page" "$selected_slot"
+    show_landing_footer
+
+    key="$(read_key)" || {
+      print_info "Input closed. Exiting."
+      printf '\n'
+      clear 2>/dev/null || true
+      exit 0
+    }
+    printf '\n'
+
+    case "$key" in
+      $'\033[A')
+        if (( total > 0 && selected_slot > 0 )); then
+          selected_slot=$(( selected_slot - 1 ))
+        fi
+        ;;
+      $'\033[B')
+        if (( total > 0 )); then
+          last_slot=$(( total - page * LANDING_PAGE_SIZE - 1 ))
+          if (( last_slot >= LANDING_PAGE_SIZE )); then
+            last_slot=$(( LANDING_PAGE_SIZE - 1 ))
+          fi
+          if (( selected_slot < last_slot )); then
+            selected_slot=$(( selected_slot + 1 ))
+          fi
+        fi
+        ;;
+      $'\033[D')
+        if (( total > 0 && page > 0 )); then
+          page=$(( page - 1 ))
+          selected_slot=0
+        fi
+        ;;
+      $'\033[C')
+        if (( total > 0 && (page + 1) * LANDING_PAGE_SIZE < total )); then
+          page=$(( page + 1 ))
+          selected_slot=0
+        fi
+        ;;
+      "")
+        if (( total > 0 )); then
+          selected_name="$(selected_profile_name "$page" "$selected_slot")" || {
+            print_warning "No profile selected"
+            pause
+            continue
+          }
+          activate_profile_by_name "$selected_name"
+        fi
+        pause
+        ;;
+      [Aa])
+        add_profile
+        pause
+        ;;
+      [Uu])
+        if (( total > 0 )); then
+          selected_name="$(selected_profile_name "$page" "$selected_slot")" || {
+            print_warning "No profile selected"
+            pause
+            continue
+          }
+          update_profile_by_name "$selected_name"
+        else
+          print_warning "No profiles available"
+        fi
+        pause
+        ;;
+      [Dd])
+        if (( total > 0 )); then
+          selected_name="$(selected_profile_name "$page" "$selected_slot")" || {
+            print_warning "No profile selected"
+            pause
+            continue
+          }
+          delete_profile_by_name "$selected_name"
+        else
+          print_warning "No profiles available"
+        fi
+        pause
+        ;;
+      [Mm])
+        manage_tools_menu
+        ;;
+      [Qq]|0)
+        clear 2>/dev/null || true
+        exit 0
+        ;;
+      *) print_warning "Invalid selection"; pause ;;
+    esac
+  done
+}
+
+usage() {
+  cat <<'EOF'
+coder - self-installing Bash profile manager for tool environment variables
+
+Usage:
+  coder
+  coder --install
+  coder --install-shell-hook
+  coder --emit-activate PROFILE_NAME
+  coder --help
+
+Notes:
+  Shell scripts cannot modify the parent shell environment unless evaluated.
+  To activate a profile in the current shell:
+    eval "$(coder --emit-activate PROFILE_NAME)"
+EOF
+}
+
+main() {
+  local rc_file
+  init_colors
+
+  case "${1:-}" in
+    "")
+      ensure_dirs
+      self_install || exit 1
+      main_menu
+      ;;
+    --install)
+      ensure_dirs
+      self_install
+      ;;
+    --install-shell-hook)
+      ensure_dirs
+      self_install || exit 1
+      rc_file="$(detect_rc_file)"
+      install_shell_hook "$rc_file" || exit 1
+      printf '%sReload your shell with:%s\n' "${DIM}" "${RESET}"
+      printf '  %ssource "%s"%s\n' "${CYAN}" "$rc_file" "${RESET}"
+      ;;
+    --emit-activate)
+      ensure_dirs
+      if [[ -z "${2:-}" ]]; then
+        printf 'Usage: coder --emit-activate PROFILE_NAME\n' >&2
+        exit 1
+      fi
+      emit_profile_exports "$2"
+      ;;
+    --help|-h)
+      usage
+      ;;
+    *)
+      printf 'Unknown option: %s\n\n' "$1" >&2
+      usage
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"
