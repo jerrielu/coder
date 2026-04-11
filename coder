@@ -3,7 +3,7 @@
 set -u
 
 APP_NAME="coder"
-VERSION="1.0.1"
+VERSION="1.0.2"
 APP_DIR="${HOME}/.coder"
 PROFILES_DIR="${APP_DIR}/profiles"
 INSTALL_DIR="${HOME}/.local/bin"
@@ -393,11 +393,11 @@ shell_hook_block() {
   block=$'\n'"$marker_start"$'\n'
   block+=$'coder() {\n'
   block+=$'  local _coder_bin="'"$INSTALL_PATH"$'"\n'
-  block+=$'  if [[ ! -f "$_coder_bin" ]]; then\n'
+  block+=$'  if [[ ! -x "$_coder_bin" ]]; then\n'
   block+=$'    printf "error coder executable not found at %s\\n" "$_coder_bin" >&2\n'
   block+=$'    return 1\n'
   block+=$'  fi\n'
-  block+=$'  ( source "$_coder_bin" "$@" )\n'
+  block+=$'  command "$_coder_bin" "$@"\n'
   block+=$'  return $?\n'
   block+=$'}\n'
   block+="$marker_end"$'\n'
@@ -610,53 +610,165 @@ load_activation_data() {
 
 write_codex_openai_model_provider_config() {
   local base_url="$1"
-  local escaped_base_url tmp_file
+  local escaped_base_url tmp_file source_file
 
   escaped_base_url="${base_url//\\/\\\\}"
   escaped_base_url="${escaped_base_url//\"/\\\"}"
 
   mkdir -p "$CODEX_CONFIG_DIR" || return 1
   tmp_file="$(mktemp "${APP_DIR}/.coder.codex-config.XXXXXX")" || return 1
+  source_file="$CODEX_CONFIG_FILE"
+  if [[ ! -f "$source_file" ]]; then
+    source_file="/dev/null"
+  fi
 
-  {
-    printf 'model_provider = "OpenAI"\n\n'
-    printf '[model_providers.OpenAI]\n'
-    printf 'name = "OpenAI"\n'
-    printf 'base_url = "%s"\n' "$escaped_base_url"
-    printf 'wire_api = "responses"\n'
-    printf 'supports_websockets = true\n'
-    printf 'requires_openai_auth = true\n'
+  awk -v openai_base_url="$escaped_base_url" '
+    BEGIN {
+      model_provider_line = "model_provider = \"OpenAI\""
+      openai_section_header = "[model_providers.OpenAI]"
+      openai_name_line = "name = \"OpenAI\""
+      openai_base_url_line = "base_url = \"" openai_base_url "\""
+      openai_wire_api_line = "wire_api = \"responses\""
+      openai_websockets_line = "supports_websockets = true"
+      openai_auth_line = "requires_openai_auth = true"
 
-    if [[ -f "$CODEX_CONFIG_FILE" ]]; then
-      awk '
-        BEGIN { skip_openai=0 }
-        {
-          if (skip_openai == 1) {
-            if ($0 ~ /^[[:space:]]*\[/) {
-              skip_openai=0
-            } else {
-              next
-            }
-          }
+      saw_model_provider = 0
+      saw_openai_section = 0
+      in_openai_section = 0
+      saw_openai_name = 0
+      saw_openai_base_url = 0
+      saw_openai_wire_api = 0
+      saw_openai_websockets = 0
+      saw_openai_auth = 0
+      saw_any_section = 0
+    }
 
-          if ($0 ~ /^[[:space:]]*model_provider[[:space:]]*=/) {
-            next
-          }
+    function is_section_header(line) {
+      return (line ~ /^[[:space:]]*\[/ && line ~ /\][[:space:]]*($|#)/)
+    }
 
-          if ($0 ~ /^[[:space:]]*openai_base_url[[:space:]]*=/) {
-            next
-          }
+    function is_openai_section_header(line) {
+      return (line ~ /^[[:space:]]*\[model_providers\.OpenAI\][[:space:]]*($|#)/)
+    }
 
-          if ($0 ~ /^[[:space:]]*\[model_providers\.OpenAI\][[:space:]]*$/) {
-            skip_openai=1
-            next
-          }
+    function emit_missing_openai_keys() {
+      if (saw_openai_name == 0) {
+        print openai_name_line
+      }
+      if (saw_openai_base_url == 0) {
+        print openai_base_url_line
+      }
+      if (saw_openai_wire_api == 0) {
+        print openai_wire_api_line
+      }
+      if (saw_openai_websockets == 0) {
+        print openai_websockets_line
+      }
+      if (saw_openai_auth == 0) {
+        print openai_auth_line
+      }
+    }
 
-          print
+    {
+      if (is_section_header($0)) {
+        if (in_openai_section == 1) {
+          emit_missing_openai_keys()
+          in_openai_section = 0
         }
-      ' "$CODEX_CONFIG_FILE"
-    fi
-  } > "$tmp_file" || {
+
+        if (saw_any_section == 0) {
+          if (saw_model_provider == 0) {
+            print model_provider_line
+            saw_model_provider = 1
+          }
+          saw_any_section = 1
+        }
+
+        if (is_openai_section_header($0)) {
+          saw_openai_section = 1
+          in_openai_section = 1
+          saw_openai_name = 0
+          saw_openai_base_url = 0
+          saw_openai_wire_api = 0
+          saw_openai_websockets = 0
+          saw_openai_auth = 0
+        }
+
+        print
+        next
+      }
+
+      if (saw_any_section == 0 && $0 ~ /^[[:space:]]*model_provider[[:space:]]*=/) {
+        if (saw_model_provider == 0) {
+          print model_provider_line
+          saw_model_provider = 1
+        }
+        next
+      }
+
+      if (in_openai_section == 1) {
+        if ($0 ~ /^[[:space:]]*name[[:space:]]*=/) {
+          if (saw_openai_name == 0) {
+            print openai_name_line
+            saw_openai_name = 1
+          }
+          next
+        }
+        if ($0 ~ /^[[:space:]]*base_url[[:space:]]*=/) {
+          if (saw_openai_base_url == 0) {
+            print openai_base_url_line
+            saw_openai_base_url = 1
+          }
+          next
+        }
+        if ($0 ~ /^[[:space:]]*wire_api[[:space:]]*=/) {
+          if (saw_openai_wire_api == 0) {
+            print openai_wire_api_line
+            saw_openai_wire_api = 1
+          }
+          next
+        }
+        if ($0 ~ /^[[:space:]]*supports_websockets[[:space:]]*=/) {
+          if (saw_openai_websockets == 0) {
+            print openai_websockets_line
+            saw_openai_websockets = 1
+          }
+          next
+        }
+        if ($0 ~ /^[[:space:]]*requires_openai_auth[[:space:]]*=/) {
+          if (saw_openai_auth == 0) {
+            print openai_auth_line
+            saw_openai_auth = 1
+          }
+          next
+        }
+      }
+
+      print
+    }
+
+    END {
+      if (in_openai_section == 1) {
+        emit_missing_openai_keys()
+      }
+
+      if (saw_model_provider == 0) {
+        print model_provider_line
+      }
+
+      if (saw_openai_section == 0) {
+        if (NR > 0) {
+          print ""
+        }
+        print openai_section_header
+        print openai_name_line
+        print openai_base_url_line
+        print openai_wire_api_line
+        print openai_websockets_line
+        print openai_auth_line
+      }
+    }
+  ' "$source_file" > "$tmp_file" || {
     rm -f "$tmp_file"
     return 1
   }
@@ -671,25 +783,134 @@ write_codex_openai_model_provider_config() {
 
 write_codex_auth_apikey_config() {
   local api_key="$1"
-  local escaped_key tmp_file
+  local escaped_key tmp_file auth_file source_file
 
   escaped_key="${api_key//\\/\\\\}"
   escaped_key="${escaped_key//\"/\\\"}"
 
   mkdir -p "$CODEX_CONFIG_DIR" || return 1
   tmp_file="$(mktemp "${APP_DIR}/.coder.codex-auth.XXXXXX")" || return 1
+  auth_file="${CODEX_CONFIG_DIR}/auth.json"
+  source_file="$auth_file"
+  if [[ ! -f "$source_file" ]]; then
+    source_file="/dev/null"
+  fi
 
-  {
-    printf '{\n'
-    printf '  "auth_mode": "apikey",\n'
-    printf '  "OPENAI_API_KEY": "%s"\n' "$escaped_key"
-    printf '}\n'
-  } > "$tmp_file" || {
+  awk -v api_key="$escaped_key" '
+    BEGIN {
+      saw_auth_mode = 0
+      saw_api_key = 0
+      line_count = 0
+    }
+
+    function leading_whitespace(line,   m) {
+      if (match(line, /^[[:space:]]*/)) {
+        return substr(line, RSTART, RLENGTH)
+      }
+      return ""
+    }
+
+    function trailing_comma(line) {
+      return (line ~ /,[[:space:]]*$/)
+    }
+
+    {
+      if ($0 ~ /^[[:space:]]*"auth_mode"[[:space:]]*:/) {
+        if (saw_auth_mode == 0) {
+          line_count += 1
+          lines[line_count] = leading_whitespace($0) "\"auth_mode\": \"apikey\"" (trailing_comma($0) ? "," : "")
+          saw_auth_mode = 1
+        }
+        next
+      }
+
+      if ($0 ~ /^[[:space:]]*"OPENAI_API_KEY"[[:space:]]*:/) {
+        if (saw_api_key == 0) {
+          line_count += 1
+          lines[line_count] = leading_whitespace($0) "\"OPENAI_API_KEY\": \"" api_key "\"" (trailing_comma($0) ? "," : "")
+          saw_api_key = 1
+        }
+        next
+      }
+
+      line_count += 1
+      lines[line_count] = $0
+    }
+
+    END {
+      close_index = 0
+      for (i = line_count; i >= 1; i -= 1) {
+        if (lines[i] ~ /^[[:space:]]*}[[:space:]]*$/) {
+          close_index = i
+          break
+        }
+      }
+
+      if (close_index == 0) {
+        if (line_count > 0) {
+          exit 2
+        }
+        print "{"
+        print "  \"auth_mode\": \"apikey\","
+        print "  \"OPENAI_API_KEY\": \"" api_key "\""
+        print "}"
+        exit 0
+      }
+
+      indent = "  "
+      for (i = 1; i < close_index; i += 1) {
+        if (lines[i] ~ /^[[:space:]]*"[^"]+"[[:space:]]*:/) {
+          indent = leading_whitespace(lines[i])
+          break
+        }
+      }
+
+      add_count = 0
+      if (saw_auth_mode == 0) {
+        add_count += 1
+        add_lines[add_count] = indent "\"auth_mode\": \"apikey\""
+      }
+      if (saw_api_key == 0) {
+        add_count += 1
+        add_lines[add_count] = indent "\"OPENAI_API_KEY\": \"" api_key "\""
+      }
+
+      if (add_count > 0) {
+        previous = 0
+        for (i = close_index - 1; i >= 1; i -= 1) {
+          if (lines[i] !~ /^[[:space:]]*$/) {
+            previous = i
+            break
+          }
+        }
+
+        if (previous > 0 && lines[previous] !~ /^[[:space:]]*{[[:space:]]*$/ && lines[previous] !~ /,[[:space:]]*$/) {
+          lines[previous] = lines[previous] ","
+        }
+      }
+
+      for (i = 1; i < close_index; i += 1) {
+        print lines[i]
+      }
+
+      for (i = 1; i <= add_count; i += 1) {
+        if (i < add_count) {
+          print add_lines[i] ","
+        } else {
+          print add_lines[i]
+        }
+      }
+
+      for (i = close_index; i <= line_count; i += 1) {
+        print lines[i]
+      }
+    }
+  ' "$source_file" > "$tmp_file" || {
     rm -f "$tmp_file"
     return 1
   }
 
-  mv "$tmp_file" "${CODEX_CONFIG_DIR}/auth.json" || {
+  mv "$tmp_file" "$auth_file" || {
     rm -f "$tmp_file"
     return 1
   }
