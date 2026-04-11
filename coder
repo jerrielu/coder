@@ -3,12 +3,13 @@
 set -u
 
 APP_NAME="coder"
+VERSION="1.0.0"
 APP_DIR="${HOME}/.coder"
 PROFILES_DIR="${APP_DIR}/profiles"
 INSTALL_DIR="${HOME}/.local/bin"
 INSTALL_PATH="${INSTALL_DIR}/${APP_NAME}"
-STATE_FILE="${APP_DIR}/active_profile"
-PENDING_ACTIVATION_FILE="${APP_DIR}/pending_activation"
+CODEX_CONFIG_DIR="${HOME}/.codex"
+CODEX_CONFIG_FILE="${CODEX_CONFIG_DIR}/config.toml"
 UPDATE_CHECK_FILE="${APP_DIR}/last_update_check"
 UPDATE_CHECK_INTERVAL_SECONDS=86400
 UPDATE_URL="${UPDATE_URL:-https://raw.githubusercontent.com/jerrielu/coder/main/coder}"
@@ -144,6 +145,45 @@ now_epoch() {
   date +%s 2>/dev/null || printf '0'
 }
 
+extract_version_from_file() {
+  local file="$1"
+  awk -F'"' '/^VERSION="[0-9]+\.[0-9]+\.[0-9]+"$/ { print $2; exit }' "$file" 2>/dev/null || true
+}
+
+version_is_valid() {
+  [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+}
+
+version_is_greater() {
+  local left="$1"
+  local right="$2"
+  local left_major left_minor left_patch right_major right_minor right_patch
+
+  version_is_valid "$left" || return 1
+  version_is_valid "$right" || return 1
+
+  IFS='.' read -r left_major left_minor left_patch <<< "$left"
+  IFS='.' read -r right_major right_minor right_patch <<< "$right"
+
+  if (( left_major > right_major )); then
+    return 0
+  elif (( left_major < right_major )); then
+    return 1
+  fi
+
+  if (( left_minor > right_minor )); then
+    return 0
+  elif (( left_minor < right_minor )); then
+    return 1
+  fi
+
+  if (( left_patch > right_patch )); then
+    return 0
+  fi
+
+  return 1
+}
+
 download_update_candidate() {
   local output_path="$1"
 
@@ -184,7 +224,7 @@ should_check_for_update() {
 }
 
 auto_update_prompt() {
-  local tmp_file
+  local tmp_file remote_version
 
   should_check_for_update || return 0
 
@@ -194,8 +234,9 @@ auto_update_prompt() {
     return 0
   fi
 
-  if [[ ! -f "$INSTALL_PATH" ]] || ! cmp -s "$INSTALL_PATH" "$tmp_file"; then
-    print_info "A newer version of coder is available."
+  remote_version="$(extract_version_from_file "$tmp_file")"
+  if version_is_greater "$remote_version" "$VERSION"; then
+    print_info "A newer version of coder is available (${remote_version} > ${VERSION})."
     if confirm_action "Install update now"; then
       chmod +x "$tmp_file" || {
         print_error "Unable to prepare update candidate"
@@ -322,17 +363,15 @@ shell_hook_block() {
   block=$'\n'"$marker_start"$'\n'
   block+=$'coder() {\n'
   block+=$'  local _coder_bin="'"$INSTALL_PATH"$'"\n'
-  block+=$'  local _coder_pending="$HOME/.coder/pending_activation"\n'
-  block+=$'  "$_coder_bin" "$@"\n'
-  block+=$'  local _coder_status=$?\n'
-  block+=$'  if [[ "${1:-}" != "--emit-activate" && -f "$_coder_pending" ]]; then\n'
-  block+=$'    local _coder_profile=""\n'
-  block+=$'    IFS= read -r _coder_profile < "$_coder_pending"\n'
-  block+=$'    rm -f "$_coder_pending"\n'
-  block+=$'    if [[ -n "$_coder_profile" ]]; then\n'
-  block+=$'      eval "$($_coder_bin --emit-activate "$_coder_profile")"\n'
-  block+=$'    fi\n'
+  block+=$'  local _coder_restore_opts=""\n'
+  block+=$'  if [[ ! -f "$_coder_bin" ]]; then\n'
+  block+=$'    printf "error coder executable not found at %s\\n" "$_coder_bin" >&2\n'
+  block+=$'    return 1\n'
   block+=$'  fi\n'
+  block+=$'  _coder_restore_opts="$(set +o)"\n'
+  block+=$'  source "$_coder_bin" "$@"\n'
+  block+=$'  local _coder_status=$?\n'
+  block+=$'  eval "$_coder_restore_opts"\n'
   block+=$'  return "$_coder_status"\n'
   block+=$'}\n'
   block+="$marker_end"$'\n'
@@ -455,6 +494,26 @@ ask() {
   printf '%s' "$answer"
 }
 
+ask_with_default() {
+  local prompt="$1"
+  local default="${2:-}"
+  local answer
+
+  if [[ -z "$default" ]]; then
+    ask "$prompt"
+    return $?
+  fi
+
+  printf '%s›%s %s' "${CARD_ACCENT}" "${RESET}" "$prompt" >&2
+  if ! IFS= read -r -e -i "$default" answer; then
+    return 1
+  fi
+  if [[ -z "$answer" ]]; then
+    answer="$default"
+  fi
+  printf '%s' "$answer"
+}
+
 read_key() {
   local key rest1 rest2
   if ! IFS= read -rsn1 key; then
@@ -512,6 +571,9 @@ load_activation_data() {
     key="${line%%=*}"
     value="${line#*=}"
     if [[ "$key" == env_* ]]; then
+      if [[ "$ACTIVATION_TOOL" == "OPENAI" ]]; then
+        continue
+      fi
       ACTIVATION_KEYS+=("${key#env_}")
       ACTIVATION_VALUES+=("$value")
     fi
@@ -520,28 +582,104 @@ load_activation_data() {
   return 0
 }
 
+write_codex_openai_model_provider_config() {
+  local base_url="$1"
+  local escaped_base_url tmp_file
+
+  escaped_base_url="${base_url//\\/\\\\}"
+  escaped_base_url="${escaped_base_url//\"/\\\"}"
+
+  mkdir -p "$CODEX_CONFIG_DIR" || return 1
+  tmp_file="$(mktemp "${APP_DIR}/.coder.codex-config.XXXXXX")" || return 1
+
+  {
+    printf 'model_provider = "OpenAI"\n\n'
+    printf '[model_providers.OpenAI]\n'
+    printf 'name = "OpenAI"\n'
+    printf 'base_url = "%s"\n' "$escaped_base_url"
+    printf 'wire_api = "responses"\n'
+    printf 'supports_websockets = true\n'
+    printf 'requires_openai_auth = true\n'
+
+    if [[ -f "$CODEX_CONFIG_FILE" ]]; then
+      awk '
+        BEGIN { skip_openai=0 }
+        {
+          if (skip_openai == 1) {
+            if ($0 ~ /^[[:space:]]*\[/) {
+              skip_openai=0
+            } else {
+              next
+            }
+          }
+
+          if ($0 ~ /^[[:space:]]*model_provider[[:space:]]*=/) {
+            next
+          }
+
+          if ($0 ~ /^[[:space:]]*openai_base_url[[:space:]]*=/) {
+            next
+          }
+
+          if ($0 ~ /^[[:space:]]*\[model_providers\.OpenAI\][[:space:]]*$/) {
+            skip_openai=1
+            next
+          }
+
+          print
+        }
+      ' "$CODEX_CONFIG_FILE"
+    fi
+  } > "$tmp_file" || {
+    rm -f "$tmp_file"
+    return 1
+  }
+
+  mv "$tmp_file" "$CODEX_CONFIG_FILE" || {
+    rm -f "$tmp_file"
+    return 1
+  }
+
+  return 0
+}
+
+write_codex_auth_apikey_config() {
+  local api_key="$1"
+  local escaped_key tmp_file
+
+  escaped_key="${api_key//\\/\\\\}"
+  escaped_key="${escaped_key//\"/\\\"}"
+
+  mkdir -p "$CODEX_CONFIG_DIR" || return 1
+  tmp_file="$(mktemp "${APP_DIR}/.coder.codex-auth.XXXXXX")" || return 1
+
+  {
+    printf '{\n'
+    printf '  "auth_mode": "apikey",\n'
+    printf '  "OPENAI_API_KEY": "%s"\n' "$escaped_key"
+    printf '}\n'
+  } > "$tmp_file" || {
+    rm -f "$tmp_file"
+    return 1
+  }
+
+  mv "$tmp_file" "${CODEX_CONFIG_DIR}/auth.json" || {
+    rm -f "$tmp_file"
+    return 1
+  }
+
+  return 0
+}
+
 print_activation_details() {
-  local state_written="$1"
-  local exported_now="$2"
-  local queued_for_hook="${3:-0}"
+  local exported_now="$1"
   local idx
 
   printf '%sActivation details:%s\n' "${BOLD}" "${RESET}"
-  if [[ "$state_written" == "1" ]]; then
-    printf '  - wrote %sactive_profile%s = %s%s%s\n' "${DIM}" "${RESET}" "${WHITE}" "${ACTIVATION_VALUES[0]}" "${RESET}"
-  else
-    printf '  - did not update %sactive_profile%s marker\n' "${DIM}" "${RESET}"
-  fi
-
   if [[ "$exported_now" == "1" ]]; then
     printf '  - exported environment in current shell:\n'
   else
-    if [[ "$queued_for_hook" == "1" ]]; then
-      printf '  - queued activation handoff in %s\n' "$PENDING_ACTIVATION_FILE"
-    else
-      printf '  - no environment exported in this process\n'
-    fi
-    printf '  - pending export set:\n'
+    printf '  - no environment exported in this process\n'
   fi
 
   for (( idx=0; idx<${#ACTIVATION_KEYS[@]}; idx+=1 )); do
@@ -571,6 +709,14 @@ tool_display_name() {
   esac
 }
 
+default_launch_bin_for_tool() {
+  case "$1" in
+    CLAUDE_CODE) printf '%s' "claude" ;;
+    OPENAI) printf '%s' "codex" ;;
+    *) printf '%s' "" ;;
+  esac
+}
+
 tool_vars_for_type() {
   case "$1" in
     CLAUDE_CODE)
@@ -588,13 +734,18 @@ tool_vars_for_type() {
 show_profile_summary() {
   local path="$1"
   local line key value
-  local tool metadata found=0
+  local tool metadata launch_bin found=0
 
   tool="$(read_profile_field "$path" "tool" 2>/dev/null || true)"
   metadata="$(read_profile_field "$path" "metadata" 2>/dev/null || true)"
+  launch_bin="$(read_profile_field "$path" "launch_bin" 2>/dev/null || true)"
+  if [[ -z "$launch_bin" ]]; then
+    launch_bin="$(default_launch_bin_for_tool "$tool")"
+  fi
 
   printf '%sTool:%s %s\n' "${DIM}" "${RESET}" "$(tool_display_name "$tool")"
   printf '%sMetadata:%s %s\n' "${DIM}" "${RESET}" "${metadata:-<none>}"
+  printf '%sLaunch Command:%s %s\n' "${DIM}" "${RESET}" "${launch_bin:-<none>}"
   printf '%sEnvironment Variables:%s\n' "${DIM}" "${RESET}"
 
   while IFS= read -r line || [[ -n "$line" ]]; do
@@ -614,11 +765,7 @@ show_profile_summary() {
 list_profiles() {
   ensure_dirs
 
-  local file name active found=0
-  active=""
-  if [[ -f "$STATE_FILE" ]]; then
-    active="$(<"$STATE_FILE")"
-  fi
+  local file name found=0
 
   print_section "Profiles"
 
@@ -627,11 +774,7 @@ list_profiles() {
     found=1
     name="${file##*/}"
     name="${name%.profile}"
-    if [[ "$name" == "$active" ]]; then
-      printf '%s•%s %s %s[active]%s\n' "${GREEN}" "${RESET}" "$name" "${GREEN}" "${RESET}"
-    else
-      printf '%s•%s %s\n' "${CARD_ACCENT}" "${RESET}" "$name"
-    fi
+    printf '%s•%s %s\n' "${CARD_ACCENT}" "${RESET}" "$name"
     show_profile_summary "$file"
     print_line
   done
@@ -706,23 +849,46 @@ choose_tool() {
 
 collect_env_vars_predefined() {
   local tool="$1"
+  local existing_path="${2:-}"
   local key value
   local keys=()
+  local existing_value
 
   mapfile -t keys < <(tool_vars_for_type "$tool") || return 1
 
   for key in "${keys[@]}"; do
     [[ -z "$key" ]] && continue
-    value="$(ask "${key}: ")" || return 1
+    existing_value=""
+    if [[ -n "$existing_path" && -f "$existing_path" ]]; then
+      existing_value="$(read_profile_field "$existing_path" "env_${key}" 2>/dev/null || true)"
+    fi
+    value="$(ask_with_default "${key}: " "$existing_value")" || return 1
     printf 'env_%s=%s\n' "$key" "$value"
   done
 }
 
 collect_env_vars_custom() {
+  local existing_path="${1:-}"
   local count input i key value
+  local -a existing_keys=()
+  local -a existing_values=()
+  local existing_count=0
+  local line existing_key existing_value
+
+  if [[ -n "$existing_path" && -f "$existing_path" ]]; then
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      existing_key="${line%%=*}"
+      existing_value="${line#*=}"
+      if [[ "$existing_key" == env_* ]]; then
+        existing_keys+=("${existing_key#env_}")
+        existing_values+=("$existing_value")
+      fi
+    done < "$existing_path"
+    existing_count="${#existing_keys[@]}"
+  fi
 
   while true; do
-    input="$(ask 'How many environment variables? ')" || return 1
+    input="$(ask_with_default 'How many environment variables? ' "${existing_count}")" || return 1
     if [[ "$input" =~ ^[0-9]+$ ]] && (( input > 0 )); then
       count="$input"
       break
@@ -733,13 +899,21 @@ collect_env_vars_custom() {
   i=1
   while (( i <= count )); do
     while true; do
-      key="$(ask "Variable ${i} key: ")" || return 1
+      existing_key=""
+      if (( i - 1 < ${#existing_keys[@]} )); then
+        existing_key="${existing_keys[i - 1]}"
+      fi
+      key="$(ask_with_default "Variable ${i} key: " "$existing_key")" || return 1
       if is_valid_env_key "$key"; then
         break
       fi
       print_warning "Invalid key. Use letters, digits, and underscores, and do not start with a digit"
     done
-    value="$(ask "Variable ${i} value: ")" || return 1
+    existing_value=""
+    if (( i - 1 < ${#existing_values[@]} )); then
+      existing_value="${existing_values[i - 1]}"
+    fi
+    value="$(ask_with_default "Variable ${i} value: " "$existing_value")" || return 1
     printf 'env_%s=%s\n' "$key" "$value"
     (( i += 1 ))
   done
@@ -749,24 +923,145 @@ write_profile() {
   local name="$1"
   local tool="$2"
   local metadata="$3"
-  local path
+  local launch_bin="${4:-}"
+  local existing_path="${5:-}"
+  local path defaults_path defaults_tmp=""
 
   path="$(profile_path "$name")"
+  defaults_path="$existing_path"
+
+  if [[ -n "$defaults_path" && "$defaults_path" == "$path" && -f "$path" ]]; then
+    defaults_tmp="$(mktemp "${APP_DIR}/.coder.profile.defaults.XXXXXX")" || return 1
+    cp "$path" "$defaults_tmp" || {
+      rm -f "$defaults_tmp"
+      return 1
+    }
+    defaults_path="$defaults_tmp"
+  fi
 
   {
     printf 'tool=%s\n' "$tool"
     if [[ "$tool" == "CUSTOM" ]]; then
-      collect_env_vars_custom
+      collect_env_vars_custom "$defaults_path"
     else
-      collect_env_vars_predefined "$tool"
+      collect_env_vars_predefined "$tool" "$defaults_path"
     fi
+    printf 'launch_bin=%s\n' "$launch_bin"
     printf 'metadata=%s\n' "$metadata"
   } > "$path" || {
+    rm -f "$defaults_tmp"
     print_error "Unable to save profile"
     return 1
   }
 
+  rm -f "$defaults_tmp"
   return 0
+}
+
+launch_tool_for_profile() {
+  local name="$1"
+  local path tool launch_bin openai_base_url openai_api_key
+  local line key value
+  local -a cmd=()
+  local -a env_keys=()
+  local -a env_values=()
+  local idx
+
+  path="$(profile_path "$name")"
+  if [[ ! -f "$path" ]]; then
+    return 1
+  fi
+
+  tool="$(read_profile_field "$path" "tool" 2>/dev/null || true)"
+  launch_bin="$(read_profile_field "$path" "launch_bin" 2>/dev/null || true)"
+  if [[ -z "$launch_bin" ]]; then
+    launch_bin="$(default_launch_bin_for_tool "$tool")"
+  fi
+
+  if [[ -z "$launch_bin" ]]; then
+    return 0
+  fi
+
+  if ! command -v "$launch_bin" >/dev/null 2>&1; then
+    print_warning "Launch command not found: ${launch_bin}"
+    return 1
+  fi
+
+  openai_base_url=""
+  openai_api_key=""
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    key="${line%%=*}"
+    value="${line#*=}"
+    if [[ "$key" == env_* ]]; then
+      key="${key#env_}"
+      if [[ "$tool" == "OPENAI" && "$key" == "OPENAI_BASE_URL" ]]; then
+        openai_base_url="$value"
+        continue
+      fi
+      if [[ "$tool" == "OPENAI" && "$key" == "OPENAI_API_KEY" ]]; then
+        openai_api_key="$value"
+        continue
+      fi
+      if [[ "$tool" == "OPENAI" ]]; then
+        continue
+      fi
+      env_keys+=("$key")
+      env_values+=("$value")
+    fi
+  done < "$path"
+
+  if [[ "$tool" == "OPENAI" && -n "$openai_base_url" ]]; then
+    if ! write_codex_openai_model_provider_config "$openai_base_url"; then
+      print_warning "Unable to write Codex OpenAI provider config to ${CODEX_CONFIG_FILE}"
+    fi
+  fi
+  if [[ "$tool" == "OPENAI" && -n "$openai_api_key" ]]; then
+    if ! write_codex_auth_apikey_config "$openai_api_key"; then
+      print_warning "Unable to write Codex auth config to ${CODEX_CONFIG_DIR}/auth.json"
+    fi
+  fi
+
+  print_info "Starting tool: ${launch_bin}"
+
+  if (( ${#env_keys[@]} > 0 )); then
+    cmd=(env)
+    for (( idx=0; idx<${#env_keys[@]}; idx+=1 )); do
+      cmd+=("${env_keys[idx]}=${env_values[idx]}")
+    done
+    cmd+=("$launch_bin")
+  else
+    cmd=("$launch_bin")
+  fi
+
+  printf '%sLaunch Plan:%s\n' "${BOLD}" "${RESET}"
+  printf '  tool: %s\n' "$launch_bin"
+  if (( ${#env_keys[@]} > 0 )); then
+    printf '  scoped environment:\n'
+    for (( idx=0; idx<${#env_keys[@]}; idx+=1 )); do
+      printf '    %s=%s\n' "${env_keys[idx]}" "${env_values[idx]}"
+    done
+  else
+    printf '  scoped environment: <none>\n'
+  fi
+  if [[ "$tool" == "OPENAI" && -n "$openai_base_url" ]]; then
+    printf '  codex config: %s\n' "$CODEX_CONFIG_FILE"
+    printf '    model_provider = "OpenAI"\n'
+    printf '    base_url = %s\n' "$openai_base_url"
+  fi
+  if [[ "$tool" == "OPENAI" && -n "$openai_api_key" ]]; then
+    printf '  codex auth: %s\n' "${CODEX_CONFIG_DIR}/auth.json"
+    printf '    auth_mode = apikey\n'
+  fi
+  print_info "Launching in 2 seconds..."
+  sleep 2
+
+  if is_sourced; then
+    "${cmd[@]}"
+    return $?
+  fi
+
+  exec "${cmd[@]}"
+  return 1
 }
 
 select_profile_name() {
@@ -803,12 +1098,7 @@ select_profile_name() {
 show_landing_profiles() {
   local page="$1"
   local selected_slot="$2"
-  local active start end total count index slot name path tool prefix suffix
-
-  active=""
-  if [[ -f "$STATE_FILE" ]]; then
-    active="$(<"$STATE_FILE")"
-  fi
+  local start end total count index slot name path tool prefix suffix
 
   load_profile_names
   total="${#PROFILE_NAMES[@]}"
@@ -842,20 +1132,11 @@ show_landing_profiles() {
       suffix="  ${CARD_ACCENT}selected${RESET}"
     fi
 
-    if [[ "$name" == "$active" ]]; then
-      printf '%s%s [%d]%s %s%s%s  %s%s%s  %sactive%s%s\n' \
-        "${CARD_ACCENT}" "$prefix" "$slot" "${RESET}" \
-        "${BOLD}" "$name" "${RESET}" \
-        "${DIM}" "$(tool_display_name "$tool")" "${RESET}" \
-        "${GREEN}" "${RESET}" \
-        "$suffix"
-    else
-      printf '%s%s [%d]%s %s%s%s  %s%s%s%s\n' \
-        "${CARD_ACCENT}" "$prefix" "$slot" "${RESET}" \
-        "${BOLD}" "$name" "${RESET}" \
-        "${DIM}" "$(tool_display_name "$tool")" "${RESET}" \
-        "$suffix"
-    fi
+    printf '%s%s [%d]%s %s%s%s  %s%s%s%s\n' \
+      "${CARD_ACCENT}" "$prefix" "$slot" "${RESET}" \
+      "${BOLD}" "$name" "${RESET}" \
+      "${DIM}" "$(tool_display_name "$tool")" "${RESET}" \
+      "$suffix"
     count=$(( count + 1 ))
   done
 
@@ -936,31 +1217,24 @@ activate_profile_by_name() {
   fi
 
   if is_sourced; then
-    activate_profile_now "$name"
+    launch_tool_for_profile "$name"
     return $?
   fi
 
-  printf '%s\n' "$name" > "$STATE_FILE" || {
-    print_error "Unable to save active profile state"
-    return 1
-  }
-  printf '%s\n' "$name" > "$PENDING_ACTIVATION_FILE" || {
-    print_error "Unable to queue pending activation"
-    return 1
-  }
+  if [[ -t 0 && -t 1 ]]; then
+    launch_tool_for_profile "$name"
+    return $?
+  fi
 
-  print_info "Activation queued for shell hook auto-export"
+  print_warning "Unable to launch tool directly in this process"
   printf '%sRun:%s\n' "${DIM}" "${RESET}"
   printf '  %seval "$(%s --emit-activate %s)"%s\n' "${CYAN}" "$INSTALL_PATH" "$name" "${RESET}"
-  printf '%sOptional shell hook:%s\n' "${DIM}" "${RESET}"
-  printf '  %s%s --install-shell-hook%s\n' "${CYAN}" "$INSTALL_PATH" "${RESET}"
-  print_success "Profile \"${name}\" marked as active"
-  print_activation_details "1" "0" "1"
-  return 0
+  print_activation_details "0"
+  return 1
 }
 
 add_profile() {
-  local name name_input tool metadata path
+  local name name_input tool metadata path launch_bin
 
   print_section "Add Profile"
 
@@ -981,8 +1255,20 @@ add_profile() {
   fi
 
   metadata="$(ask 'Metadata/notes (optional): ')" || return 1
+  launch_bin=""
+  if [[ "$tool" == "CUSTOM" ]]; then
+    launch_bin="$(trim "$(ask 'Tool binary to launch (required): ')" )" || return 1
+    if [[ -z "$launch_bin" ]]; then
+      print_warning "Custom tool binary is required"
+      return 1
+    fi
+    if [[ "$launch_bin" =~ [[:space:]] ]]; then
+      print_warning "Use a single binary name or path without spaces"
+      return 1
+    fi
+  fi
 
-  if ! write_profile "$name" "$tool" "$metadata"; then
+  if ! write_profile "$name" "$tool" "$metadata" "$launch_bin"; then
     return 1
   fi
 
@@ -991,7 +1277,8 @@ add_profile() {
 
 update_profile_by_name() {
   local name="$1"
-  local path tool metadata
+  local path tool metadata launch_bin
+  local existing_tool existing_metadata existing_launch_bin tool_input
 
   path="$(profile_path "$name")"
   if [[ ! -f "$path" ]]; then
@@ -1000,24 +1287,39 @@ update_profile_by_name() {
   fi
 
   print_section "Update Profile"
-  printf '\n%sCurrent profile%s\n' "${BOLD}" "${RESET}"
-  show_profile_summary "$path"
-  printf '\n%sYou are updating the selected profile.%s\n' "${DIM}" "${RESET}"
+  existing_tool="$(read_profile_field "$path" "tool" 2>/dev/null || true)"
+  existing_metadata="$(read_profile_field "$path" "metadata" 2>/dev/null || true)"
+  existing_launch_bin="$(read_profile_field "$path" "launch_bin" 2>/dev/null || true)"
 
-  if ! confirm_action "Continue updating \"${name}\""; then
-    print_info "Update cancelled"
-    return 1
+  while true; do
+    tool_input="$(ask_with_default 'Tool type (CLAUDE_CODE/OPENAI/CUSTOM): ' "$existing_tool")" || return 1
+    tool_input="$(trim "$tool_input")"
+    case "${tool_input^^}" in
+      CLAUDE_CODE|OPENAI|CUSTOM)
+        tool="${tool_input^^}"
+        break
+        ;;
+      *)
+        print_warning "Invalid tool type. Use CLAUDE_CODE, OPENAI, or CUSTOM"
+        ;;
+    esac
+  done
+
+  metadata="$(ask_with_default 'Metadata/notes (optional): ' "$existing_metadata")" || return 1
+  launch_bin=""
+  if [[ "$tool" == "CUSTOM" ]]; then
+    launch_bin="$(trim "$(ask_with_default 'Tool binary to launch (required): ' "$existing_launch_bin")" )" || return 1
+    if [[ -z "$launch_bin" ]]; then
+      print_warning "Custom tool binary is required"
+      return 1
+    fi
+    if [[ "$launch_bin" =~ [[:space:]] ]]; then
+      print_warning "Use a single binary name or path without spaces"
+      return 1
+    fi
   fi
-  if ! confirm_action "Confirm update for \"${name}\""; then
-    print_info "Update cancelled"
-    return 1
-  fi
 
-  choose_tool || return 1
-  tool="$CHOSEN_TOOL"
-  metadata="$(ask 'Metadata/notes (optional): ')" || return 1
-
-  if ! write_profile "$name" "$tool" "$metadata"; then
+  if ! write_profile "$name" "$tool" "$metadata" "$launch_bin" "$path"; then
     return 1
   fi
 
@@ -1026,7 +1328,7 @@ update_profile_by_name() {
 
 delete_profile_by_name() {
   local name="$1"
-  local path active
+  local path
 
   path="$(profile_path "$name")"
   if [[ ! -f "$path" ]]; then
@@ -1050,13 +1352,6 @@ delete_profile_by_name() {
   if ! rm -f "$path"; then
     print_error "Unable to remove profile"
     return 1
-  fi
-
-  if [[ -f "$STATE_FILE" ]]; then
-    active="$(<"$STATE_FILE")"
-    if [[ "$active" == "$name" ]]; then
-      rm -f "$STATE_FILE"
-    fi
   fi
 
   print_success "Profile \"${name}\" deleted"
@@ -1089,7 +1384,6 @@ emit_profile_exports() {
     return 1
   fi
 
-  printf 'rm -f %s\n' "$(shell_escape "$PENDING_ACTIVATION_FILE")"
   for (( idx=0; idx<${#ACTIVATION_KEYS[@]}; idx+=1 )); do
     printf 'export %s=%s\n' "${ACTIVATION_KEYS[idx]}" "$(shell_escape "${ACTIVATION_VALUES[idx]}")"
   done
@@ -1114,10 +1408,8 @@ activate_profile_now() {
     export "${ACTIVATION_KEYS[idx]}=${ACTIVATION_VALUES[idx]}"
   done
 
-  rm -f "$PENDING_ACTIVATION_FILE"
-  printf '%s\n' "$name" > "$STATE_FILE"
   print_success "Profile \"${name}\" activated in current shell"
-  print_activation_details "1" "1" "0"
+  print_activation_details "1"
   return 0
 }
 
@@ -1164,7 +1456,7 @@ main_menu() {
       print_info "Input closed. Exiting."
       printf '\n'
       clear 2>/dev/null || true
-      exit 0
+      return 0
     }
     printf '\n'
 
@@ -1204,7 +1496,9 @@ main_menu() {
             pause
             continue
           }
-          activate_profile_by_name "$selected_name"
+          if activate_profile_by_name "$selected_name"; then
+            return 0
+          fi
         fi
         pause
         ;;
@@ -1243,7 +1537,7 @@ main_menu() {
         ;;
       [Qq]|0)
         clear 2>/dev/null || true
-        exit 0
+        return 0
         ;;
       *) print_warning "Invalid selection"; pause ;;
     esac
@@ -1256,16 +1550,23 @@ coder - self-installing Bash profile manager for tool environment variables
 
 Usage:
   coder
+  coder version
   coder --install
   coder --install-shell-hook
   coder --emit-activate PROFILE_NAME
+  coder --version
   coder --help
 
 Notes:
-  Shell scripts cannot modify the parent shell environment unless evaluated.
-  To activate a profile in the current shell:
+  Profile activation launches the selected tool with profile environment variables
+  applied only to that launched process.
+  Manual fallback for non-integrated shells:
     eval "$(coder --emit-activate PROFILE_NAME)"
 EOF
+}
+
+print_version() {
+  printf '%s %s\n' "$APP_NAME" "$VERSION"
 }
 
 main() {
@@ -1275,7 +1576,7 @@ main() {
   case "${1:-}" in
     "")
       ensure_dirs
-      self_install || exit 1
+      self_install || return 1
       auto_update_prompt
       main_menu
       ;;
@@ -1285,9 +1586,9 @@ main() {
       ;;
     --install-shell-hook)
       ensure_dirs
-      self_install || exit 1
+      self_install || return 1
       rc_file="$(detect_rc_file)"
-      install_shell_hook "$rc_file" || exit 1
+      install_shell_hook "$rc_file" || return 1
       printf '%sReload your shell with:%s\n' "${DIM}" "${RESET}"
       printf '  %ssource "%s"%s\n' "${CYAN}" "$rc_file" "${RESET}"
       ;;
@@ -1295,9 +1596,12 @@ main() {
       ensure_dirs
       if [[ -z "${2:-}" ]]; then
         printf 'Usage: coder --emit-activate PROFILE_NAME\n' >&2
-        exit 1
+        return 1
       fi
       emit_profile_exports "$2"
+      ;;
+    version|--version|-v)
+      print_version
       ;;
     --help|-h)
       usage
@@ -1305,9 +1609,14 @@ main() {
     *)
       printf 'Unknown option: %s\n\n' "$1" >&2
       usage
-      exit 1
+      return 1
       ;;
   esac
 }
+
+if is_sourced; then
+  main "$@"
+  return $?
+fi
 
 main "$@"

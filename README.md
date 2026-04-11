@@ -25,15 +25,12 @@ curl -fsSL https://raw.githubusercontent.com/jerrielu/coder/main/install.sh | ba
 These use the requested industry-standard environment variables.
 
 - Claude Code
-  - `ANTHROPIC_API_KEY`
-  - `ANTHROPIC_BASE_URL`
-- OpenAI Codex / OpenAI API
-  - `OPENAI_API_KEY`
-  - `OPENAI_BASE_URL`
+- OpenAI Codex
 
 ### Custom Tools
 
 Custom profiles accept any valid environment-variable names and values.
+When creating or updating a custom profile, `coder` also asks for a required tool binary to launch.
 
 ## Storage Design
 
@@ -48,4 +45,10 @@ Configuration is stored under:
 
 ```bash
 coder --help
+```
+
+### Version
+
+```bash
+coder --version
 ```
